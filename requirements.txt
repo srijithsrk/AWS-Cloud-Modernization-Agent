@@ -1,0 +1,12 @@
+strands-agents>=1.0.0
+bedrock-agentcore>=0.1.0
+mcp>=1.6.0
+boto3>=1.35.0
+aws-opentelemetry-distro>=0.10.1
+
+# uv provides the `uvx` launcher used to run the AWS MCP servers (each MCP
+# server is published as an independent PyPI package and started on demand).
+uv>=0.5.0
+
+# Used by tools/terraform_validate.py to security-scan generated Terraform.
+checkov>=3.2.0
