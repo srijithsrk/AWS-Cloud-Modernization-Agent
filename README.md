@@ -133,11 +133,20 @@ cloud-modernization-agent/
 │   ├── diagrams.py            # generate_architecture_diagram (Mermaid)
 │   ├── repo_analyzer.py        # analyze_repository
 │   └── terraform_validate.py   # validate_terraform (terraform + checkov)
-├── tests/                     # pytest unit tests for the custom tools
+├── webapp/                    # Async chat webapp (Streamlit + 2 Lambdas) - see below
+│   ├── streamlit_app.py         # Chat UI
+│   ├── response_parsing.py       # Pure parsing logic (unit tested separately from streamlit_app.py)
+│   ├── lambda_api.py             # Lambda A: POST /chat + GET /chat/{job_id} (fast path only)
+│   ├── lambda_worker.py          # Lambda B: does the actual (slow) agent call
+│   ├── dynamo_helpers.py         # Shared DynamoDB job-table access
+│   ├── auth_helpers.py           # Shared-secret request authentication
+│   └── requirements.txt
+├── tests/                     # pytest unit tests for the custom tools + webapp
 ├── deploy/
 │   ├── create_role.py          # Creates the IAM execution role
 │   ├── deploy_runtime.py        # Creates the AgentCore Runtime resource
-│   └── invoke_runtime.py         # Invokes the deployed agent
+│   ├── invoke_runtime.py         # Invokes the deployed agent (CLI, incl. --chat)
+│   └── deploy_webapp.py          # Creates the DynamoDB table, 2 Lambdas, and API Gateway
 ├── iam/
 │   ├── trust-policy.json        # Who can assume the execution role
 │   └── execution-policy.json     # What the role is allowed to do
@@ -348,6 +357,97 @@ different `--runtime-name`. There is intentionally no auto-update path here
 to keep the beginner flow simple and explicit — see the [AWS AgentCore
 Runtime docs](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/what-is-bedrock-agentcore.html)
 for in-place update options once you're comfortable.
+
+## 3. Chat webapp (Streamlit + API Gateway + Lambda)
+
+A browser-friendly alternative to `invoke_runtime.py --chat` — a Streamlit
+chat UI, publicly reachable behind an API Gateway HTTP API, with no AWS
+credentials ever touching the browser.
+
+### Why two Lambdas, not one
+
+API Gateway has a hard, non-configurable **~29-second integration timeout**
+that cannot be raised no matter how a Lambda's own timeout is configured.
+This agent can legitimately take 3-90+ seconds depending on the request
+(e.g. Terraform generation with validation). So instead of one Lambda that
+waits on the agent synchronously (which would time out on exactly the
+slower, more interesting requests), this uses an async "ticket number"
+pattern:
+
+```mermaid
+sequenceDiagram
+    participant U as Streamlit
+    participant GW as API Gateway
+    participant A as Lambda A (api-handler)
+    participant DB as DynamoDB
+    participant B as Lambda B (worker)
+    participant AC as Bedrock AgentCore
+
+    U->>GW: POST /chat {prompt, session_id}
+    GW->>A: invoke (proxy)
+    A->>DB: PutItem status=pending
+    A->>B: invoke ASYNC (Event) - fire and forget
+    A-->>U: 202 {job_id}
+    Note over U: total time so far: under 1s
+
+    par Lambda B runs independently
+        B->>AC: InvokeAgentRuntime (slow: 3s-90s+)
+        AC-->>B: agent response
+        B->>DB: UpdateItem status=completed, result=...
+    and Streamlit polls every ~2s
+        U->>GW: GET /chat/{job_id}
+        GW->>A: invoke (proxy)
+        A->>DB: GetItem
+        DB-->>A: status=pending
+        A-->>U: {status: "pending"}
+    end
+    U->>GW: GET /chat/{job_id} (next poll)
+    GW->>A: invoke (proxy)
+    A->>DB: GetItem
+    DB-->>A: status=completed, result=...
+    A-->>U: {status: "completed", result: ...}
+```
+
+`POST /chat` returns almost instantly (writes a DynamoDB record, fires off
+Lambda B asynchronously via `InvocationType="Event"`, returns a `job_id`) —
+it's Lambda B, which nothing is waiting on synchronously, that's allowed to
+take as long as the agent needs. DynamoDB is the only way the two separate,
+stateless Lambda invocations can hand off information to each other and to
+repeated polling requests.
+
+### Access control
+
+HTTP APIs (API Gateway v2) don't support the classic "API Gateway API Keys +
+Usage Plan" feature (that's REST API / v1 only). Instead, `lambda_api.py`
+checks a shared secret sent as the `x-api-key` header, using a timing-safe
+comparison. Keep this secret private — anyone with it can invoke your agent
+and run up Bedrock costs.
+
+### Deploy the backend
+
+```powershell
+cd "c:\Users\ksrijith\Desktop\Capstone\cloud-modernization-agent"
+.\.venv\Scripts\python.exe deploy/deploy_webapp.py --agent-runtime-arn "<your-agent-runtime-arn>" --region us-east-1
+```
+
+This creates the DynamoDB table, both Lambda functions' IAM roles, deploys
+both Lambda functions, and creates the HTTP API + routes. It prints
+`API_BASE_URL` and `API_SHARED_SECRET` at the end — save both.
+
+### Run the Streamlit app locally
+
+```powershell
+pip install -r webapp/requirements.txt
+$env:API_BASE_URL = "<the API_BASE_URL printed above>"
+$env:API_SHARED_SECRET = "<the API_SHARED_SECRET printed above>"
+streamlit run webapp/streamlit_app.py
+```
+
+(You can also paste the URL/key directly into the sidebar instead of using
+environment variables.) Each browser session gets its own conversation
+`session_id`, so follow-up questions continue the same agent conversation,
+same as the CLI `--chat` mode. Click "Start a new conversation" in the
+sidebar to reset it.
 
 ## Observability (optional but recommended)
 
