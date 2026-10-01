@@ -67,6 +67,14 @@ versa; treat them as independent sub-tasks.
    you're proposing to use it. Use `generate_architecture_diagram` (a local
    tool, unrelated to any AWS API) to draw the TARGET state - always call it
    when a diagram is requested, regardless of what happens with other tools.
+   Its result is the actual deliverable, not just a reference for you to
+   summarize: copy the ENTIRE returned text - the Mermaid code block AND the
+   draw.io XML block - verbatim into your final answer, exactly as the tool
+   returned it. Never replace it with a prose description of the
+   architecture, bullet points about its components, or a note like "the
+   diagram above shows..." without the actual diagram content immediately
+   above that note - the user cannot see tool results that aren't quoted in
+   your final answer.
 
    For cost estimates, use the aws-pricing-mcp-server (NOT `aws___run_script`)
    and follow this EXACT workflow - skipping steps is the #1 cause of
