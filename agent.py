@@ -17,6 +17,7 @@ Deploy: see README.md.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -29,7 +30,7 @@ from strands.types.agent import Limits
 from strands.types.exceptions import EventLoopException, MaxTokensReachedException
 
 import config
-from mcp_setup import mcp_tools_session
+from mcp_setup import get_mcp_tools
 from tools.diagrams import generate_architecture_diagram
 from tools.repo_analyzer import analyze_repository
 from tools.terraform_validate import validate_terraform
@@ -39,11 +40,21 @@ logger = logging.getLogger(__name__)
 
 app = BedrockAgentCoreApp()
 
-SYSTEM_PROMPT = """\
+SYSTEM_PROMPT = f"""\
 You are an AWS Cloud Modernization Agent. You help engineers analyze existing
 systems, design target AWS architectures, and generate deployment-ready
 Infrastructure as Code, following the same three-phase workflow a senior AWS
 architect uses.
+
+Scope restriction - you ONLY help with AWS cloud architecture design or
+analysis, AWS cost/pricing estimates, and generating Terraform for AWS
+deployments. If a request falls outside that scope, do not attempt to
+answer it - reply with exactly this and nothing else:
+"{config.OFF_TOPIC_DECLINE_MESSAGE}"
+A Bedrock Guardrail enforces this same restriction independently as the
+primary safeguard (it blocks the input before you are even invoked); this
+instruction is a second line of defense for borderline cases the
+guardrail's topic match might miss.
 
 Never expose your internal reasoning in your answer - do not write
 `<thinking>` tags or similar chain-of-thought preambles into the response
@@ -93,7 +104,6 @@ versa; treat them as independent sub-tasks.
         confirmed values. Omit the `region` argument entirely for global
         services like `AWSDataTransfer` or `AmazonCloudFront` - passing a
         region for these causes empty results. ALWAYS pass
-        `output_options={"pricing_terms": ["OnDemand"]}` (not just for
         large services) to keep the response small - this is a long-running
         chat, and unfiltered pricing responses bloat every later turn's
         context unnecessarily.
@@ -102,6 +112,8 @@ versa; treat them as independent sub-tasks.
         `get_pricing` ONCE - do not keep guessing filter values in a loop.
         For simple/small services, prefer fewer filters (or none beyond
         region) over risking a wrong guess.
+   ALWAYS pass `output_options={{"pricing_terms": ["OnDemand"]}}` (not just
+   for large services) to keep the response small.
    State your usage assumptions (storage, requests, data transfer, etc.)
    explicitly alongside the resulting numeric cost.
 3. Implementation Phase - Generate Infrastructure as Code. ALWAYS write
@@ -175,6 +187,24 @@ _AGENT_LIMITS = Limits(
 # an output limit is an expected, recoverable event, not a server error.
 _MAX_CONTINUATIONS = int(os.environ.get("AGENT_MAX_CONTINUATIONS", "3"))
 
+# Only attached when deploy/deploy_guardrail.py has actually provisioned a
+# guardrail and its ID/version were set as env vars - see config.py.
+_guardrail_kwargs = (
+    {
+        "guardrail_id": config.GUARDRAIL_ID,
+        "guardrail_version": config.GUARDRAIL_VERSION,
+        "guardrail_redact_input_message": config.OFF_TOPIC_DECLINE_MESSAGE,
+        # Default (False) sends the ENTIRE conversation history to the
+        # guardrail on every turn, not just the new message - confirmed in
+        # production this makes one earlier off-topic message permanently
+        # poison the rest of that session, blocking later on-topic follow-ups
+        # too (finish_reason="guardrail_intervened" on a clean AWS question).
+        "guardrail_latest_message": True,
+    }
+    if config.GUARDRAIL_ID and config.GUARDRAIL_VERSION
+    else {}
+)
+
 _model = BedrockModel(
     model_id=config.BEDROCK_MODEL_ID,
     region_name=config.BEDROCK_REGION,
@@ -188,6 +218,7 @@ _model = BedrockModel(
     streaming=False,
     temperature=config.MODEL_TEMPERATURE,
     max_tokens=config.MODEL_MAX_TOKENS,
+    **_guardrail_kwargs,
 )
 
 _CUSTOM_TOOLS = [generate_architecture_diagram, analyze_repository]
@@ -220,6 +251,38 @@ def _get_session_messages(session_id: str | None) -> list:
             _session_messages[session_id] = []
         _session_messages.move_to_end(session_id)
         return _session_messages[session_id]
+
+
+def _extract_text(message: dict | None) -> str:
+    """Flatten a Strands message's content blocks into plain text, for the
+    conversation log below (not shown to the end user)."""
+    if not message:
+        return ""
+    content = message.get("content") or []
+    return "\n".join(block["text"] for block in content if isinstance(block, dict) and "text" in block)
+
+
+def _log_conversation_turn(
+    session_id: str | None, user_message: str, response_message: dict | None, warning: str | None = None
+) -> None:
+    """Emit one structured JSON log line per turn so full conversations are
+    directly searchable in CloudWatch Logs (CloudWatch Logs Insights can
+    auto-parse a JSON log line), independent of whatever the OTEL/GenAI
+    Observability trace pipeline captures - see README's Observability
+    section. This intentionally logs the full prompt/response text; the
+    CloudWatch log group's retention/access controls are the place to
+    manage that, not this function."""
+    logger.info(
+        json.dumps(
+            {
+                "event": "conversation_turn",
+                "session_id": session_id,
+                "prompt": user_message,
+                "response": _extract_text(response_message),
+                "warning": warning,
+            }
+        )
+    )
 
 
 def _invoke_with_recovery(agent: Agent, user_message: str):
@@ -277,37 +340,37 @@ def invoke(payload: dict, context: RequestContext | None = None) -> dict:
     session_id = getattr(context, "session_id", None)
     history = _get_session_messages(session_id)
 
-    with mcp_tools_session() as mcp_tools:
-        agent = Agent(
-            model=_model,
-            tools=[*mcp_tools, *_CUSTOM_TOOLS],
-            system_prompt=SYSTEM_PROMPT,
-            messages=history,
+    mcp_tools = get_mcp_tools()  # connected once per container, reused across every request - see mcp_setup.py
+    agent = Agent(
+        model=_model,
+        tools=[*mcp_tools, *_CUSTOM_TOOLS],
+        system_prompt=SYSTEM_PROMPT,
+        messages=history,
+    )
+    try:
+        result = _invoke_with_recovery(agent, user_message)
+    except MaxTokensReachedException:
+        logger.warning("Still truncated after %d auto-continuation attempts", _MAX_CONTINUATIONS)
+        response_message = agent.messages[-1] if agent.messages else None
+        warning = (
+            f"The response was too long to complete even after automatically continuing "
+            f"{_MAX_CONTINUATIONS} times. Try asking for a smaller piece (e.g. one resource "
+            "at a time), or raise BEDROCK_MODEL_MAX_TOKENS / AGENT_MAX_CONTINUATIONS."
         )
-        try:
-            result = _invoke_with_recovery(agent, user_message)
-        except MaxTokensReachedException:
-            logger.warning("Still truncated after %d auto-continuation attempts", _MAX_CONTINUATIONS)
-            return {
-                "result": agent.messages[-1] if agent.messages else None,
-                "warning": (
-                    f"The response was too long to complete even after automatically continuing "
-                    f"{_MAX_CONTINUATIONS} times. Try asking for a smaller piece (e.g. one resource "
-                    "at a time), or raise BEDROCK_MODEL_MAX_TOKENS / AGENT_MAX_CONTINUATIONS."
-                ),
-            }
+        _log_conversation_turn(session_id, user_message, response_message, warning)
+        return {"result": response_message, "warning": warning}
 
     if result.stop_reason in ("limit_turns", "limit_total_tokens", "limit_output_tokens"):
         logger.warning("Agent hit a loop limit (%s) before finishing.", result.stop_reason)
-        return {
-            "result": result.message,
-            "warning": (
-                f"Stopped early ({result.stop_reason}) before producing a complete answer. "
-                "Try a narrower prompt (e.g. one phase at a time), or raise AGENT_MAX_TURNS / "
-                "AGENT_MAX_TOTAL_TOKENS if this is a legitimately large request."
-            ),
-        }
+        warning = (
+            f"Stopped early ({result.stop_reason}) before producing a complete answer. "
+            "Try a narrower prompt (e.g. one phase at a time), or raise AGENT_MAX_TURNS / "
+            "AGENT_MAX_TOTAL_TOKENS if this is a legitimately large request."
+        )
+        _log_conversation_turn(session_id, user_message, result.message, warning)
+        return {"result": result.message, "warning": warning}
 
+    _log_conversation_turn(session_id, user_message, result.message)
     return {"result": result.message}
 
 

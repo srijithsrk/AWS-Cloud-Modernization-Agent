@@ -1,5 +1,7 @@
-"""Creates (or updates) the Bedrock AgentCore Runtime for this agent, given
-an already-built and pushed ARM64 container image.
+"""Creates (or, if a runtime with the same --runtime-name already exists,
+updates it in place - same ARN, no webapp redeploy needed) the Bedrock
+AgentCore Runtime for this agent, given an already-built and pushed ARM64
+container image.
 
 Usage:
     python deploy/deploy_runtime.py \
@@ -11,6 +13,39 @@ from __future__ import annotations
 import argparse
 
 import boto3
+
+# Baked-in default for Bedrock AgentCore Observability (see README's
+# Observability section): keep full model/tool payloads on OTEL spans
+# instead of the ADOT default redaction. `--env` can still override this if
+# ever needed.
+#
+# NOTE: a per-agent-own-log-group span destination (UNIFIED_TRACES_DESTINATION_ENABLED)
+# was evaluated but dropped - it requires aws-opentelemetry-distro>=0.18.0,
+# which triggers a severe pip dependency-resolver backtrack against
+# bedrock-agentcore in a clean install (confirmed: a fresh install backtracks
+# through 20+ historical bedrock-agentcore releases trying to satisfy both
+# constraints). Not worth the build fragility for a nice-to-have; spans
+# still land in the shared aws/spans log group, and agent.py's explicit
+# per-turn JSON log line already gives a complete, reliable conversation
+# record independent of ADOT version.
+DEFAULT_ENV_VARS = {
+    "AWS_GENAI_CONTENT_EXTRACTION_OPT_OUT": "true",
+}
+
+
+def _find_runtime_by_name(client, name: str) -> dict | None:
+    next_token = None
+    while True:
+        kwargs = {"maxResults": 100}
+        if next_token:
+            kwargs["nextToken"] = next_token
+        response = client.list_agent_runtimes(**kwargs)
+        for summary in response.get("agentRuntimes", []):
+            if summary["agentRuntimeName"] == name:
+                return summary
+        next_token = response.get("nextToken")
+        if not next_token:
+            return None
 
 
 def main() -> None:
@@ -28,29 +63,31 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    env_vars = dict(kv.split("=", 1) for kv in args.env)
+    env_vars = {**DEFAULT_ENV_VARS, **dict(kv.split("=", 1) for kv in args.env)}
 
     client = boto3.client("bedrock-agentcore-control", region_name=args.region)
+    artifact = {"containerConfiguration": {"containerUri": args.image_uri}}
 
-    kwargs = dict(
-        agentRuntimeName=args.runtime_name,
-        agentRuntimeArtifact={"containerConfiguration": {"containerUri": args.image_uri}},
-        networkConfiguration={"networkMode": "PUBLIC"},
-        roleArn=args.role_arn,
-    )
-    if env_vars:
-        kwargs["environmentVariables"] = env_vars
-
-    try:
-        response = client.create_agent_runtime(**kwargs)
-        print("Created new agent runtime.")
-    except client.exceptions.ConflictException:
-        print(
-            f"A runtime named '{args.runtime_name}' already exists. Delete it first with:\n"
-            f"  aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id <id>\n"
-            "or re-run with a different --runtime-name."
+    existing = _find_runtime_by_name(client, args.runtime_name)
+    if existing:
+        response = client.update_agent_runtime(
+            agentRuntimeId=existing["agentRuntimeId"],
+            agentRuntimeArtifact=artifact,
+            networkConfiguration={"networkMode": "PUBLIC"},
+            roleArn=args.role_arn,
+            environmentVariables=env_vars,
         )
-        raise
+        print(f"Updated existing agent runtime '{args.runtime_name}' in place (ARN unchanged).")
+    else:
+        response = client.create_agent_runtime(
+            agentRuntimeName=args.runtime_name,
+            agentRuntimeArtifact=artifact,
+            networkConfiguration={"networkMode": "PUBLIC"},
+            roleArn=args.role_arn,
+            environmentVariables=env_vars,
+        )
+        print("Created new agent runtime.")
+
 
     print(f"Agent Runtime ARN: {response['agentRuntimeArn']}")
     print(f"Status: {response.get('status', 'UNKNOWN')}")

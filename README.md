@@ -449,12 +449,41 @@ environment variables.) Each browser session gets its own conversation
 same as the CLI `--chat` mode. Click "Start a new conversation" in the
 sidebar to reset it.
 
-## Observability (optional but recommended)
+## Observability (all conversations logged)
 
-The Dockerfile already runs the app under `opentelemetry-instrument`, so
-traces/metrics show up automatically in **CloudWatch → GenAI Observability**
-once you enable CloudWatch Transaction Search (one-time, per account/region):
-CloudWatch console → Application Signals (APM) → Transaction search → Enable.
+The Dockerfile already runs the app under `opentelemetry-instrument` with
+`aws-opentelemetry-distro` installed, so traces/metrics show up automatically
+in **CloudWatch → GenAI Observability** - no code changes needed for that
+part. On top of that, `agent.py` emits one structured JSON log line per
+conversation turn (`{"event": "conversation_turn", "session_id", "prompt",
+"response", "warning"}`), so every conversation is directly queryable in
+CloudWatch Logs Insights (`fields prompt, response | filter event =
+"conversation_turn"`) regardless of the trace pipeline.
+
+One-time account setup (needed before any of the above appears anywhere):
+enable CloudWatch Transaction Search - CloudWatch console → Application
+Signals (APM) → Transaction search → Enable (select "ingest spans as
+structured logs"). Equivalent CLI:
+```
+aws logs put-resource-policy --policy-name AgentCoreTransactionSearch --policy-document file://transaction-search-policy.json
+aws xray update-trace-segment-destination --destination CloudWatchLogs
+```
+(`transaction-search-policy.json` is the X-Ray-to-CloudWatch-Logs resource
+policy from [AWS's docs](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-configure.html#observability-configure-builtin-cw) - it's account-level, not specific to this agent.)
+
+`deploy/deploy_runtime.py` bakes in one env var by default (override with
+`--env` if you ever need to): `AWS_GENAI_CONTENT_EXTRACTION_OPT_OUT=true`,
+which keeps full model/tool payloads on spans instead of ADOT's default
+redaction.
+
+(A per-agent-own-log-group span destination, via
+`UNIFIED_TRACES_DESTINATION_ENABLED`, was evaluated but intentionally not
+used - it requires `aws-opentelemetry-distro>=0.18.0`, which triggers a
+severe pip dependency-resolver backtrack against `bedrock-agentcore` in a
+clean install. Not worth the build fragility for a nice-to-have: spans
+still land in the account's shared `aws/spans` log group either way, and
+the conversation_turn log line above already gives a complete record
+independent of this.)
 
 ## Security notes
 

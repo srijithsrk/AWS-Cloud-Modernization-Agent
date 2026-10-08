@@ -102,6 +102,28 @@ MODEL_TEMPERATURE = float(os.environ.get("BEDROCK_MODEL_TEMPERATURE", "0.2"))
 MODEL_MAX_TOKENS = int(os.environ.get("BEDROCK_MODEL_MAX_TOKENS", "8192"))
 
 # ---------------------------------------------------------------------------
+# Guardrail (topic restriction)
+# ---------------------------------------------------------------------------
+# Confines the agent to its intended purpose (AWS architecture/cost/Terraform
+# only) and gives a hard, cost-saving stop for anything else: a Bedrock
+# Guardrail evaluates the user's input BEFORE the model is invoked, so an
+# off-topic message never triggers a (potentially multi-tool-call, multi-
+# dollar) agent loop at all. See deploy/deploy_guardrail.py to create/update
+# the guardrail resource itself. Left unset by default so the agent still
+# runs fine locally/in tests without one provisioned.
+GUARDRAIL_ID = os.environ.get("GUARDRAIL_ID")
+GUARDRAIL_VERSION = os.environ.get("GUARDRAIL_VERSION")
+
+# Shown to the user both when the guardrail blocks an off-topic input AND,
+# as a second line of defense, by the system prompt instructing the model to
+# decline the same way itself - see agent.py's SYSTEM_PROMPT.
+OFF_TOPIC_DECLINE_MESSAGE = (
+    "I'm an AWS Cloud Modernization Agent, so I can only help with AWS "
+    "architecture design, AWS cost estimates, and generating Terraform for "
+    "AWS deployments. Could you rephrase your question around one of those topics?"
+)
+
+# ---------------------------------------------------------------------------
 # Feature flags
 # ---------------------------------------------------------------------------
 # Terraform validation shells out to the `terraform` and `checkov` CLIs.
