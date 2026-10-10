@@ -3,6 +3,10 @@ updates it in place - same ARN, no webapp redeploy needed) the Bedrock
 AgentCore Runtime for this agent, given an already-built and pushed ARM64
 container image.
 
+If a guardrail created by deploy_guardrail.py exists, it's wired in
+automatically (its latest published version) unless --no-guardrail is
+passed or GUARDRAIL_ID/GUARDRAIL_VERSION are already set via --env.
+
 Usage:
     python deploy/deploy_runtime.py \
         --image-uri 123456789012.dkr.ecr.us-east-1.amazonaws.com/cloud-modernization-agent:latest \
@@ -11,8 +15,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 
 import boto3
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for `import deploy.deploy_guardrail`
+from deploy.deploy_guardrail import DEFAULT_GUARDRAIL_NAME
 
 # Baked-in default for Bedrock AgentCore Observability (see README's
 # Observability section): keep full model/tool payloads on OTEL spans
@@ -48,6 +57,45 @@ def _find_runtime_by_name(client, name: str) -> dict | None:
             return None
 
 
+def _find_latest_guardrail(region: str, name: str) -> tuple[str, str] | None:
+    """Look up a guardrail by name and return (id, latest published version),
+    skipping the mutable DRAFT version. Returns None if no guardrail with
+    that name exists yet (e.g. deploy_guardrail.py hasn't been run)."""
+    client = boto3.client("bedrock", region_name=region)
+
+    guardrail_id = None
+    next_token = None
+    while guardrail_id is None:
+        kwargs = {"maxResults": 100}
+        if next_token:
+            kwargs["nextToken"] = next_token
+        response = client.list_guardrails(**kwargs)
+        for summary in response.get("guardrails", []):
+            if summary["name"] == name:
+                guardrail_id = summary["id"]
+                break
+        next_token = response.get("nextToken")
+        if not next_token:
+            break
+    if guardrail_id is None:
+        return None
+
+    versions: list[int] = []
+    next_token = None
+    while True:
+        kwargs = {"guardrailIdentifier": guardrail_id, "maxResults": 100}
+        if next_token:
+            kwargs["nextToken"] = next_token
+        response = client.list_guardrails(**kwargs)
+        versions.extend(int(g["version"]) for g in response.get("guardrails", []) if g["version"] != "DRAFT")
+        next_token = response.get("nextToken")
+        if not next_token:
+            break
+    if not versions:
+        return None
+    return guardrail_id, str(max(versions))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image-uri", required=True)
@@ -61,9 +109,32 @@ def main() -> None:
         metavar="KEY=VALUE",
         help="Environment variable to set on the runtime, e.g. --env BEDROCK_MODEL_ID=amazon.nova-pro-v1:0. Repeatable.",
     )
+    parser.add_argument(
+        "--no-guardrail",
+        action="store_true",
+        help="Skip auto-wiring the guardrail created by deploy_guardrail.py, even if one exists.",
+    )
     args = parser.parse_args()
 
     env_vars = {**DEFAULT_ENV_VARS, **dict(kv.split("=", 1) for kv in args.env)}
+
+    if args.no_guardrail:
+        print("--no-guardrail passed: deploying without topic restriction.")
+    elif "GUARDRAIL_ID" in env_vars:
+        print(f"Using explicitly-provided guardrail: GUARDRAIL_ID={env_vars['GUARDRAIL_ID']}")
+    else:
+        found = _find_latest_guardrail(args.region, DEFAULT_GUARDRAIL_NAME)
+        if found:
+            guardrail_id, guardrail_version = found
+            env_vars["GUARDRAIL_ID"] = guardrail_id
+            env_vars["GUARDRAIL_VERSION"] = guardrail_version
+            print(f"Auto-wiring guardrail '{DEFAULT_GUARDRAIL_NAME}': GUARDRAIL_ID={guardrail_id} GUARDRAIL_VERSION={guardrail_version}")
+        else:
+            print(
+                f"No guardrail named '{DEFAULT_GUARDRAIL_NAME}' found - deploying without topic "
+                "restriction. Run deploy/deploy_guardrail.py first to enable it (recommended), "
+                "or pass --no-guardrail to silence this message."
+            )
 
     client = boto3.client("bedrock-agentcore-control", region_name=args.region)
     artifact = {"containerConfiguration": {"containerUri": args.image_uri}}

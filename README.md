@@ -87,11 +87,11 @@ avoids that server's `guardpycfn` dependency requiring a Rust toolchain to
 compile for linux/arm64. See `config.py` for the exact MCP servers wired up
 and why.
 
-**Topic guardrail (optional).** A Bedrock Guardrail can restrict the agent
-to AWS architecture/cost/Terraform questions only, rejecting everything
-else before the model is ever invoked (no tokens spent on off-topic
-requests). It's optional and off by default - see
-[Guardrail (optional)](#guardrail-optional-topic-restriction) below.
+**Topic guardrail.** A Bedrock Guardrail restricts the agent to AWS
+architecture/cost/Terraform questions only, rejecting everything else
+before the model is ever invoked (no tokens spent on off-topic requests).
+It's provisioned once and then wired in automatically on every deploy - see
+[Guardrail](#guardrail-on-by-default-once-provisioned) below.
 
 ## Foundation model
 
@@ -456,12 +456,11 @@ environment variables.) Each browser session gets its own conversation
 same as the CLI `--chat` mode. Click "Start a new conversation" in the
 sidebar to reset it.
 
-## Guardrail (optional topic restriction)
+## Guardrail (on by default once provisioned)
 
-By default the agent will try to answer anything. To restrict it to AWS
-architecture/cost/Terraform questions only - rejecting everything else
-*before* the model is even invoked (no tokens spent on off-topic requests) -
-provision a Bedrock Guardrail and wire it in:
+A Bedrock Guardrail restricts the agent to AWS architecture/cost/Terraform
+questions only, rejecting everything else *before* the model is even
+invoked (no tokens spent on off-topic requests). Provision it once:
 
 ```powershell
 python deploy/deploy_guardrail.py --region $REGION
@@ -469,13 +468,14 @@ python deploy/deploy_guardrail.py --region $REGION
 
 This creates (or, on a re-run, updates) a guardrail with a few DENY topics
 (general knowledge questions, creative writing requests, personal advice)
-and publishes a new version, printing `GUARDRAIL_ID` and `GUARDRAIL_VERSION`.
-Pass both into `deploy_runtime.py`:
-
-```powershell
-python deploy/deploy_runtime.py --image-uri <image> --role-arn <role> `
-  --env GUARDRAIL_ID=<printed id> --env GUARDRAIL_VERSION=<printed version>
-```
+and publishes a new version. **From then on, every `deploy_runtime.py` run
+automatically finds and wires it in** - it looks up a guardrail named
+`cloud-modernization-agent-scope-guardrail` and uses its latest published
+version, so you don't need to pass `--env GUARDRAIL_ID=...` yourself or
+remember to re-wire it on future redeploys. To deploy without it, pass
+`--no-guardrail`; to point at a different guardrail entirely, pass
+`--env GUARDRAIL_ID=... --env GUARDRAIL_VERSION=...` explicitly (that
+always takes priority over auto-discovery).
 
 **If you edit the topic list**, verify your changes against this agent's
 own system prompt before redeploying - Bedrock sends the system prompt
@@ -493,6 +493,7 @@ resp = client.apply_guardrail(
 )
 print(resp["action"])  # must be "NONE" - anything else means a topic is too broad
 ```
+
 
 ## Observability (all conversations logged)
 
@@ -563,5 +564,5 @@ independent of this.)
 | Cost/pricing answers seem missing or limited | The AWS MCP Server (`https://aws-mcp.us-east-1.api.aws/mcp`) is currently only available in `us-east-1` and `eu-central-1`; `config.py` always connects to the `us-east-1` endpoint regardless of `AWS_REGION` (the `--metadata AWS_REGION=...` flag only sets the default *target* region for the API calls it makes on your behalf) |
 | `validate_terraform` says both CLIs are missing | You're running outside the deployed container (e.g. `python agent.py` on a machine without `terraform`/`checkov`); set `ENABLE_TERRAFORM_VALIDATION=false` locally if you don't need it |
 | `build_via_codebuild.py` fails or the build status is `FAILED` | Check the printed CloudWatch logs link for the actual build error - usually a `requirements.txt` dependency conflict (run `pip install --dry-run -r requirements.txt` locally first) or an IAM permission gap for the CodeBuild role |
-| Guardrail blocks a clearly on-topic question | A DENY topic's definition is too broad, or it matches the agent's own system prompt - see [Guardrail](#guardrail-optional-topic-restriction) above for how to verify topic definitions with `ApplyGuardrail` directly |
+| Guardrail blocks a clearly on-topic question | A DENY topic's definition is too broad, or it matches the agent's own system prompt - see [Guardrail](#guardrail-on-by-default-once-provisioned) above for how to verify topic definitions with `ApplyGuardrail` directly |
 | First request very slow / times out | Cold start downloading MCP server packages via `uvx`; the Dockerfile pre-warms the cache, but first-ever cold start can still take 20-30s |

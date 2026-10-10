@@ -29,6 +29,10 @@ import boto3
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for `import config`
 import config
 
+# Shared with deploy_runtime.py, which auto-discovers a guardrail with this
+# name so it's wired in by default without needing --env GUARDRAIL_ID=...
+DEFAULT_GUARDRAIL_NAME = "cloud-modernization-agent-scope-guardrail"
+
 TOPIC_POLICY_CONFIG = {
     # IMPORTANT: Bedrock Guardrails' topic classifier cannot reliably handle a
     # NEGATED topic definition (e.g. "anything not about AWS") - confirmed in
@@ -105,7 +109,7 @@ def _find_guardrail_by_name(client, name: str) -> dict | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--name", default="cloud-modernization-agent-scope-guardrail")
+    parser.add_argument("--name", default=DEFAULT_GUARDRAIL_NAME)
     parser.add_argument("--region", default=config.BEDROCK_REGION)
     args = parser.parse_args()
 
