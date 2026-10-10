@@ -164,12 +164,35 @@ def _ensure_route(apigw, api_id: str, route_key: str, integration_id: str) -> No
     apigw.create_route(ApiId=api_id, RouteKey=route_key, Target=target)
 
 
-def _ensure_stage(apigw, api_id: str) -> None:
+def _ensure_stage(apigw, api_id: str, default_route_settings: dict, route_settings: dict) -> None:
     for page in apigw.get_paginator("get_stages").paginate(ApiId=api_id):
         for stage in page["Items"]:
             if stage["StageName"] == "$default":
+                # Re-applied on every run (not just at creation) so changing
+                # throttle limits and re-running this script takes effect.
+                apigw.update_stage(
+                    ApiId=api_id,
+                    StageName="$default",
+                    DefaultRouteSettings=default_route_settings,
+                    RouteSettings=route_settings,
+                )
                 return
-    apigw.create_stage(ApiId=api_id, StageName="$default", AutoDeploy=True)
+    apigw.create_stage(
+        ApiId=api_id,
+        StageName="$default",
+        AutoDeploy=True,
+        DefaultRouteSettings=default_route_settings,
+        RouteSettings=route_settings,
+    )
+
+
+def _ensure_concurrency(lambda_client, function_name: str, limit: int) -> None:
+    """Set reserved concurrency, or remove it (unbounded, up to the account's
+    shared pool) if limit is 0 or negative."""
+    if limit <= 0:
+        lambda_client.delete_function_concurrency(FunctionName=function_name)
+    else:
+        lambda_client.put_function_concurrency(FunctionName=function_name, ReservedConcurrentExecutions=limit)
 
 
 def _allow_apigateway_to_invoke(lambda_client, function_name: str, account_id: str, region: str, api_id: str) -> None:
@@ -197,6 +220,31 @@ def main() -> None:
         "--api-secret",
         default=None,
         help="Shared secret clients must send as the x-api-key header. Auto-generated and printed if omitted.",
+    )
+    parser.add_argument(
+        "--chat-rate-limit", type=float, default=2.0,
+        help="Steady-state req/sec for POST /chat (the expensive, Bedrock-invoking route). Default 2.",
+    )
+    parser.add_argument(
+        "--chat-burst-limit", type=int, default=5,
+        help="Burst capacity for POST /chat. Default 5.",
+    )
+    parser.add_argument(
+        "--poll-rate-limit", type=float, default=10.0,
+        help="Steady-state req/sec for GET /chat/{job_id} (cheap polling reads, called every ~2s by Streamlit). Default 10.",
+    )
+    parser.add_argument(
+        "--poll-burst-limit", type=int, default=20,
+        help="Burst capacity for GET /chat/{job_id}. Default 20.",
+    )
+    parser.add_argument(
+        "--worker-concurrency", type=int, default=5,
+        help="Reserved concurrency for the worker Lambda. AgentCore Runtime itself only processes "
+        "~2 concurrent invocations per container, so a small margin above that is enough; pass 0 to leave unbounded. Default 5.",
+    )
+    parser.add_argument(
+        "--api-concurrency", type=int, default=20,
+        help="Reserved concurrency for the api-handler Lambda (fast path); pass 0 to leave unbounded. Default 20.",
     )
     args = parser.parse_args()
 
@@ -266,6 +314,7 @@ def main() -> None:
         _WORKER_LAMBDA_TIMEOUT_SECONDS,
     )
     print(f"Worker Lambda ARN: {worker_arn}")
+    _ensure_concurrency(lambda_client, args.worker_lambda_name, args.worker_concurrency)
 
     print("Deploying api Lambda ...")
     api_zip = _zip_files(["dynamo_helpers.py", "auth_helpers.py", "lambda_api.py"])
@@ -283,6 +332,7 @@ def main() -> None:
         _API_LAMBDA_TIMEOUT_SECONDS,
     )
     print(f"Api Lambda ARN: {api_lambda_arn}")
+    _ensure_concurrency(lambda_client, args.api_lambda_name, args.api_concurrency)
 
     print(f"Ensuring HTTP API '{args.api_name}' exists ...")
     apigw = session.client("apigatewayv2")
@@ -290,7 +340,15 @@ def main() -> None:
     integration_id = _ensure_integration(apigw, api_id, api_lambda_arn)
     _ensure_route(apigw, api_id, "POST /chat", integration_id)
     _ensure_route(apigw, api_id, "GET /chat/{job_id}", integration_id)
-    _ensure_stage(apigw, api_id)
+    _ensure_stage(
+        apigw,
+        api_id,
+        default_route_settings={"ThrottlingBurstLimit": args.poll_burst_limit, "ThrottlingRateLimit": args.poll_rate_limit},
+        route_settings={
+            "POST /chat": {"ThrottlingBurstLimit": args.chat_burst_limit, "ThrottlingRateLimit": args.chat_rate_limit},
+            "GET /chat/{job_id}": {"ThrottlingBurstLimit": args.poll_burst_limit, "ThrottlingRateLimit": args.poll_rate_limit},
+        },
+    )
     _allow_apigateway_to_invoke(lambda_client, args.api_lambda_name, account_id, region, api_id)
 
     api_base_url = f"https://{api_id}.execute-api.{region}.amazonaws.com"

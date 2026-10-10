@@ -441,6 +441,25 @@ This creates the DynamoDB table, both Lambda functions' IAM roles, deploys
 both Lambda functions, and creates the HTTP API + routes. It prints
 `API_BASE_URL` and `API_SHARED_SECRET` at the end — save both.
 
+**Rate limiting and concurrency, on by default.** To bound cost from a
+traffic spike or abuse, the script also sets per-route API Gateway
+throttling and Lambda reserved concurrency with sensible defaults:
+
+| Setting | Default | Why |
+|---|---|---|
+| `POST /chat` throttle | 2 req/s, burst 5 | The expensive route (triggers a real Bedrock invocation) - no legitimate user sends messages faster than this |
+| `GET /chat/{job_id}` throttle | 10 req/s, burst 20 | Cheap DynamoDB reads, but Streamlit polls this every ~2s - generous enough that normal polling never self-throttles |
+| worker Lambda reserved concurrency | 5 | AgentCore Runtime itself only processes ~2 concurrent invocations per container, so a small margin above that is enough |
+| api-handler Lambda reserved concurrency | 20 | Fast/cheap, but still capped as a backstop against a request flood |
+
+All of these are overridable (`--chat-rate-limit`, `--chat-burst-limit`,
+`--poll-rate-limit`, `--poll-burst-limit`, `--worker-concurrency`,
+`--api-concurrency`) - pass `0` to either `*-concurrency` flag to leave that
+Lambda's concurrency unbounded. Per-API-key quotas (e.g. "100 req/day for
+customer X") aren't supported here - that's an HTTP API (API Gateway v2)
+limitation, not something this script can add; it would need a REST API or
+a hand-rolled token-bucket.
+
 ### Run the Streamlit app locally
 
 ```powershell
