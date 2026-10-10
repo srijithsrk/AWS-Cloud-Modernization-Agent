@@ -1,36 +1,83 @@
 # Cloud Modernization Agent (Amazon Bedrock AgentCore)
 
-An Amazon Bedrock AgentCore agent that replicates the workflow from the AWS
-blog [*Agentic Cloud Modernization: Accelerating Modernization with AWS MCPs
-and Kiro*](https://aws.amazon.com/blogs/migration-and-modernization/agentic-cloud-modernization-accelerating-modernization-with-aws-mcps-and-kiro/) —
-but as a standalone, API-invocable agent instead of an IDE copilot. Ask it to:
+An Amazon Bedrock AgentCore agent that helps engineers modernize AWS
+workloads end to end, as a standalone, API-invocable agent (chat in, chat
+out - no IDE required). Ask it to:
 
 - **Analyze** an existing codebase and produce current-state documentation + a diagram
 - **Plan** a target AWS architecture, grounded in current AWS docs/best practices, with a diagram and a real cost estimate
 - **Implement** the target architecture as Terraform, validated before it's handed back to you (deployment code is always Terraform, regardless of how the request is phrased - see `agent.py`'s system prompt)
 
-## How this maps to the original blog
+> **Model in use today:** `us.anthropic.claude-sonnet-4-5-20250929-v1:0`.
+> Bedrock model IDs get retired over time - see
+> [Foundation model](#foundation-model) below for how to check this model is
+> still active before you deploy, and how to move to a newer version if not.
 
-| Blog phase | Blog's MCP servers | This agent |
+## Architecture
+
+End-to-end flow from a user request to a response, covering both ways to
+talk to the agent (a direct CLI/SDK call, or the optional chat webapp):
+
+```mermaid
+flowchart TB
+    cli["CLI / your own code\ndeploy/invoke_runtime.py\nor any boto3 caller"]
+
+    subgraph webapp ["Chat webapp (optional, see below)"]
+        direction LR
+        streamlit["Streamlit UI"] -- "POST /chat" --> apigw["API Gateway"]
+        apigw --> lambdaA["Lambda: api-handler"]
+        lambdaA -- "write job, invoke async" --> dynamo[("DynamoDB\njob table")]
+        lambdaA -. "202 job_id" .-> streamlit
+        lambdaA -- "invoke" --> lambdaB["Lambda: worker"]
+        lambdaB -- "write result" --> dynamo
+        streamlit -. "GET /chat/{job_id}\npoll ~2s" .-> apigw
+    end
+
+    cli -- "InvokeAgentRuntime" --> runtime
+    lambdaB -- "InvokeAgentRuntime" --> runtime
+
+    subgraph runtime ["Bedrock AgentCore Runtime (this container)"]
+        direction TB
+        guardrail{"Bedrock Guardrail\n(optional topic check)"}
+        agent["Strands Agent"]
+        model["Foundation Model"]
+        subgraph mcp ["MCP tools (subprocess, SigV4-signed)"]
+            awsmcp["AWS MCP Server\ndocs + skills"]
+            pricing["aws-pricing-mcp-server\nreal cost data"]
+        end
+        subgraph custom ["Custom tools (in-process)"]
+            diagram["generate_architecture_diagram"]
+            analyzer["analyze_repository"]
+            tfvalidate["validate_terraform"]
+        end
+        log[("CloudWatch Logs\nconversation + traces")]
+
+        guardrail -- "on-topic" --> agent
+        guardrail -. "off-topic" .-> decline["canned decline message"]
+        agent <--> model
+        model --> mcp
+        model --> custom
+        agent -- "logs every turn" --> log
+    end
+
+    runtime -- "response" --> cli
+    runtime -- "response" --> lambdaB
+```
+
+## Design choices
+
+This agent is built almost entirely on official, actively-maintained
+tooling rather than a grab-bag of individual MCP servers:
+
+| Phase | Tooling | Notes |
 |---|---|---|
-| Analysis | `core-mcp-server`, `code-doc-gen-mcp-server`, `aws-diagram-mcp-server` | `analyze_repository` + `generate_architecture_diagram` custom tools |
-| Planning | `aws-documentation-mcp-server`, `aws-knowledge-mcp-server`, `aws-pricing-mcp-server` | **AWS MCP Server** (Agent Toolkit for AWS) - `aws___search_documentation`, `aws___retrieve_skill`, `aws___run_script`, etc. - plus `awslabs.aws-pricing-mcp-server` for real cost data |
-| Implementation | `cdk-mcp-server`, `terraform-mcp-server` | `validate_terraform` custom tool only - deployment code is always Terraform (see below) |
+| Analysis | `analyze_repository` + `generate_architecture_diagram` custom tools | No first-party MCP server covers repo analysis or diagram generation, so these are small, auditable custom tools |
+| Planning | **AWS MCP Server** (Agent Toolkit for AWS) - `aws___search_documentation`, `aws___retrieve_skill`, `aws___run_script`, etc. - plus `awslabs.aws-pricing-mcp-server` for real cost data | AWS's current guidance is to use the officially supported **[Agent Toolkit for AWS](https://github.com/aws/agent-toolkit-for-aws)** and its single managed AWS MCP Server rather than the older, now-retired individual AWS Labs docs/knowledge servers |
+| Implementation | `validate_terraform` custom tool only - deployment code is always Terraform | See below |
 
-**Why the substitutions?** As of this writing, `core-mcp-server`,
-`code-doc-gen-mcp-server`, `aws-diagram-mcp-server`, `cdk-mcp-server`, and
-`terraform-mcp-server` no longer exist in
-[awslabs/mcp](https://github.com/awslabs/mcp/tree/main/src). AWS's own
-guidance is now to move off the individual AWS Labs docs/knowledge servers
-entirely and onto the officially supported **[Agent Toolkit for
-AWS](https://github.com/aws/agent-toolkit-for-aws)** and its single managed
-**AWS MCP Server** — so that's what this agent uses for documentation
-search and best-practice "skills" (the successor to the blog's Agent SOPs).
-Diagram generation and repository analysis have no first-party MCP
-equivalent, so this agent restores that functionality with small, auditable
-custom tools. Real cost data uses the dedicated `awslabs.aws-pricing-mcp-server`
-because the AWS MCP Server's sandboxed `aws___run_script` blocks `boto3`
-even for read-only pricing lookups.
+Real cost data uses the dedicated `awslabs.aws-pricing-mcp-server` because
+the AWS MCP Server's sandboxed `aws___run_script` blocks `boto3` even for
+read-only pricing lookups.
 
 **Terraform-only implementation.** This agent deliberately never generates
 CDK or CloudFormation - only Terraform, always validated with
@@ -40,31 +87,13 @@ avoids that server's `guardpycfn` dependency requiring a Rust toolchain to
 compile for linux/arm64. See `config.py` for the exact MCP servers wired up
 and why.
 
-## Architecture
+**Topic guardrail (optional).** A Bedrock Guardrail can restrict the agent
+to AWS architecture/cost/Terraform questions only, rejecting everything
+else before the model is ever invoked (no tokens spent on off-topic
+requests). It's optional and off by default - see
+[Guardrail (optional)](#guardrail-optional-topic-restriction) below.
 
-```mermaid
-flowchart LR
-    user(("User")) -- "prompt" --> runtime["Bedrock AgentCore Runtime\n(this container)"]
-    subgraph runtime_internals ["Strands Agent"]
-        model["Foundation Model\n(Claude Sonnet 4.5 by default)"]
-        subgraph mcp ["MCP tools (subprocess, SigV4-signed)"]
-            awsmcp["AWS MCP Server\n(Agent Toolkit for AWS)\ndocs + skills + run_script"]
-            pricing["awslabs.aws-pricing-mcp-server\n(real cost data)"]
-        end
-        subgraph custom ["Custom tools (in-process)"]
-            diagram["generate_architecture_diagram"]
-            analyzer["analyze_repository"]
-            tfvalidate["validate_terraform"]
-        end
-    end
-    runtime --> model
-    model --> mcp
-    model --> custom
-    model -- "answer" --> runtime
-    runtime -- "response" --> user
-```
-
-## Foundation model choice
+## Foundation model
 
 Default: **`us.anthropic.claude-sonnet-4-5-20250929-v1:0`** (Amazon Bedrock,
 cross-region inference profile). Chosen by weighing cost, security/
@@ -144,30 +173,35 @@ cloud-modernization-agent/
 ├── tests/                     # pytest unit tests for the custom tools + webapp
 ├── deploy/
 │   ├── create_role.py          # Creates the IAM execution role
-│   ├── deploy_runtime.py        # Creates the AgentCore Runtime resource
+│   ├── build_via_codebuild.py    # Builds + pushes the container image via AWS CodeBuild
+│   ├── deploy_runtime.py        # Creates (or updates in place) the AgentCore Runtime resource
 │   ├── invoke_runtime.py         # Invokes the deployed agent (CLI, incl. --chat)
+│   ├── deploy_guardrail.py       # (Optional) creates/updates the topic-restriction guardrail
 │   └── deploy_webapp.py          # Creates the DynamoDB table, 2 Lambdas, and API Gateway
 ├── iam/
 │   ├── trust-policy.json        # Who can assume the execution role
 │   └── execution-policy.json     # What the role is allowed to do
-├── Dockerfile                  # linux/arm64 image (required by AgentCore Runtime)
+├── Dockerfile                  # linux/arm64 image (required by AgentCore Runtime), built via CodeBuild - see buildspec.yml
 ├── requirements.txt
 └── .env.example
 ```
 
 ## Prerequisites
 
-1. **An AWS account** with permissions to use Bedrock, IAM, ECR, and Bedrock
-   AgentCore (ask an admin for `AdministratorAccess` while learning, then
-   scope down later).
+1. **An AWS account** with permissions to use Bedrock, IAM, ECR, CodeBuild, S3,
+   and Bedrock AgentCore (ask an admin for `AdministratorAccess` while
+   learning, then scope down later).
 2. **Enable model access**: AWS Console → Amazon Bedrock → Model access →
-   request access to `Claude Sonnet 4.5` (and `Amazon Nova Pro` if you plan
-   to try it). This is a one-time, account+region setting.
+   request access to `Claude Sonnet 4.5`. This is a one-time, account+region
+   setting.
 3. **AWS credentials configured locally**: run `aws configure` (needs the
    [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)).
-4. **Python 3.12+** and **Docker Desktop** (or Finch/Podman) installed and running.
+4. **Python 3.12+**. No local container engine is required - container
+   images are built remotely via AWS CodeBuild (see "Deploy to Amazon
+   Bedrock AgentCore Runtime" below).
 5. Install the [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
-   tool locally too if you want to test the MCP servers outside Docker.
+   tool locally too if you want to run the agent and its MCP servers directly
+   on your machine (Step 1 below).
 
 ## 1. Run and test locally (no AWS deployment yet)
 
@@ -206,19 +240,18 @@ pytest -v
 
 ## 2. Deploy to Amazon Bedrock AgentCore Runtime
 
-> **No Docker on this machine?** That's fine - Step 3 below has a
-> Docker-free option (Option A) that builds the image in AWS CodeBuild
-> instead. You'll need broader IAM permissions than local testing required
-> (IAM role creation, ECR, S3, CodeBuild, and `bedrock-agentcore-control`).
-> On a personal sandbox account, the simplest way to get these is to attach
-> the AWS managed `AdministratorAccess` policy to your test IAM user via the
+> You'll need broader IAM permissions than local testing required (IAM role
+> creation, ECR, S3, CodeBuild, and `bedrock-agentcore-control`). On a
+> personal sandbox account, the simplest way to get these is to attach the
+> AWS managed `AdministratorAccess` policy to your test IAM user via the
 > console (IAM → Users → your user → Add permissions → Attach policies
 > directly → search `AdministratorAccess`), then detach it again once
 > deployment is done.
 
 Amazon Bedrock AgentCore Runtime only accepts **linux/arm64** container
-images. All commands below assume PowerShell on Windows with Docker Desktop
-running.
+images. The container is built in **AWS CodeBuild**, not locally - no Docker
+(or any container engine) needs to be installed on your machine. All
+commands below assume PowerShell on Windows.
 
 ### Step 1 — Note your account ID and pick a region
 
@@ -241,17 +274,11 @@ AWS Pricing/Cost Explorer APIs and a starter set of read-only Describe/List
 actions (used by the AWS MCP Server's `aws___run_script` tool). Copy the
 printed `ROLE_ARN` value. See `iam/execution-policy.json` for the full list,
 and narrow or extend the `AwsMcpServerResourceDiscovery` statement to match
-the AWS services you actually want the agent to inspect.
+the AWS services you actually want the agent to inspect. Re-running this
+script is safe any time you change `iam/execution-policy.json` - it updates
+the role's policy in place.
 
-### Step 3 — Build and push the container image to ECR
-
-### Option A (no Docker installed) — build via AWS CodeBuild
-
-If you can't install Docker Desktop locally (e.g. a locked-down corporate
-laptop), `deploy/build_via_codebuild.py` builds and pushes the image for you
-inside a managed AWS CodeBuild ARM64 environment - no local container engine
-needed at all, and it's actually faster than local buildx since there's no
-x86→ARM emulation:
+### Step 3 — Build and push the container image
 
 ```powershell
 python deploy/build_via_codebuild.py --repo-name cloud-modernization-agent --region $REGION
@@ -259,32 +286,11 @@ python deploy/build_via_codebuild.py --repo-name cloud-modernization-agent --reg
 
 This creates (if they don't already exist): an S3 bucket to stage the source
 zip, an ECR repository, an IAM role for CodeBuild, and a CodeBuild project;
-then it starts the build and polls until it finishes, printing the final
-`IMAGE_URI` to use in Step 5. It typically takes a few minutes.
+then it starts the build (defined in `buildspec.yml`, using the `Dockerfile`)
+and polls until it finishes, printing the final `IMAGE_URI` to use in the
+next step. It typically takes a few minutes.
 
-### Option B (Docker installed) — build locally
-
-```powershell
-aws ecr create-repository --repository-name cloud-modernization-agent --region $REGION
-
-docker buildx create --use
-docker buildx build --platform linux/arm64 `
-  -t "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/cloud-modernization-agent:latest" `
-  --push .
-```
-
-Optionally test the image locally before pushing further:
-
-```powershell
-docker run --platform linux/arm64 -p 8080:8080 `
-  -e AWS_ACCESS_KEY_ID=$env:AWS_ACCESS_KEY_ID `
-  -e AWS_SECRET_ACCESS_KEY=$env:AWS_SECRET_ACCESS_KEY `
-  -e AWS_SESSION_TOKEN=$env:AWS_SESSION_TOKEN `
-  -e AWS_REGION=$REGION `
-  "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/cloud-modernization-agent:latest"
-```
-
-### Step 5 — Create the Agent Runtime
+### Step 4 — Create (or update) the Agent Runtime
 
 ```powershell
 python deploy/deploy_runtime.py `
@@ -294,8 +300,11 @@ python deploy/deploy_runtime.py `
 ```
 
 Copy the printed **Agent Runtime ARN** — you'll need it for every invocation.
+This script is idempotent: if a runtime with the same `--runtime-name`
+already exists, it's updated in place with the new image (same ARN, nothing
+else to re-wire) instead of failing.
 
-### Step 6 — Invoke your deployed agent
+### Step 5 — Invoke your deployed agent
 
 ```powershell
 python deploy/invoke_runtime.py `
@@ -351,12 +360,10 @@ dependency tree) instead.
 
 ### Redeploying after a code change
 
-Rebuild and push the image (Step 3), then either delete and recreate the
-runtime, or push a new image tag and call `create_agent_runtime` again with a
-different `--runtime-name`. There is intentionally no auto-update path here
-to keep the beginner flow simple and explicit — see the [AWS AgentCore
-Runtime docs](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/what-is-bedrock-agentcore.html)
-for in-place update options once you're comfortable.
+Repeat Steps 3 and 4: rebuild the image, then re-run `deploy_runtime.py`
+with the same `--runtime-name` (the default). It updates the existing
+runtime in place - same ARN, nothing else to re-wire (webapp, saved ARNs,
+etc. all keep working unchanged).
 
 ## 3. Chat webapp (Streamlit + API Gateway + Lambda)
 
@@ -426,7 +433,7 @@ and run up Bedrock costs.
 ### Deploy the backend
 
 ```powershell
-cd "c:\Users\ksrijith\Desktop\Capstone\cloud-modernization-agent"
+cd "<path-to-this-repo>/cloud-modernization-agent"
 .\.venv\Scripts\python.exe deploy/deploy_webapp.py --agent-runtime-arn "<your-agent-runtime-arn>" --region us-east-1
 ```
 
@@ -448,6 +455,44 @@ environment variables.) Each browser session gets its own conversation
 `session_id`, so follow-up questions continue the same agent conversation,
 same as the CLI `--chat` mode. Click "Start a new conversation" in the
 sidebar to reset it.
+
+## Guardrail (optional topic restriction)
+
+By default the agent will try to answer anything. To restrict it to AWS
+architecture/cost/Terraform questions only - rejecting everything else
+*before* the model is even invoked (no tokens spent on off-topic requests) -
+provision a Bedrock Guardrail and wire it in:
+
+```powershell
+python deploy/deploy_guardrail.py --region $REGION
+```
+
+This creates (or, on a re-run, updates) a guardrail with a few DENY topics
+(general knowledge questions, creative writing requests, personal advice)
+and publishes a new version, printing `GUARDRAIL_ID` and `GUARDRAIL_VERSION`.
+Pass both into `deploy_runtime.py`:
+
+```powershell
+python deploy/deploy_runtime.py --image-uri <image> --role-arn <role> `
+  --env GUARDRAIL_ID=<printed id> --env GUARDRAIL_VERSION=<printed version>
+```
+
+**If you edit the topic list**, verify your changes against this agent's
+own system prompt before redeploying - Bedrock sends the system prompt
+through the guardrail on every call too, so a topic definition that's too
+broad can end up blocking the agent's own instructions (and therefore every
+request). Check with Bedrock's `ApplyGuardrail` API directly, which reports
+exactly which topic matched:
+
+```python
+import boto3, agent
+client = boto3.client("bedrock-runtime", region_name="us-east-1")
+resp = client.apply_guardrail(
+    guardrailIdentifier="<id>", guardrailVersion="<version>", source="INPUT",
+    content=[{"text": {"text": agent.SYSTEM_PROMPT}}],
+)
+print(resp["action"])  # must be "NONE" - anything else means a topic is too broad
+```
 
 ## Observability (all conversations logged)
 
@@ -516,6 +561,7 @@ independent of this.)
 | Agent responses omit docs/skills/cost data | The AWS MCP Server or awslabs.aws-pricing-mcp-server failed to start; check CloudWatch logs for `"An MCP server failed to start"` warnings |
 | `ExpiredTokenException` / `No AWS credentials found` from the AWS MCP Server | The execution role's temporary credentials weren't available to the container's credential chain; verify the runtime's IAM role is attached correctly (see [AWS's own auth troubleshooting table](https://docs.aws.amazon.com/agent-toolkit/latest/userguide/getting-started-aws-mcp-server.html#troubleshooting-auth-errors)) |
 | Cost/pricing answers seem missing or limited | The AWS MCP Server (`https://aws-mcp.us-east-1.api.aws/mcp`) is currently only available in `us-east-1` and `eu-central-1`; `config.py` always connects to the `us-east-1` endpoint regardless of `AWS_REGION` (the `--metadata AWS_REGION=...` flag only sets the default *target* region for the API calls it makes on your behalf) |
-| `validate_terraform` says both CLIs are missing | You're running outside the Docker image (e.g. `python agent.py` on a machine without `terraform`/`checkov`); set `ENABLE_TERRAFORM_VALIDATION=false` locally if you don't need it |
-| `docker buildx build` fails on Windows | Ensure Docker Desktop is running and `docker buildx create --use` succeeded first |
+| `validate_terraform` says both CLIs are missing | You're running outside the deployed container (e.g. `python agent.py` on a machine without `terraform`/`checkov`); set `ENABLE_TERRAFORM_VALIDATION=false` locally if you don't need it |
+| `build_via_codebuild.py` fails or the build status is `FAILED` | Check the printed CloudWatch logs link for the actual build error - usually a `requirements.txt` dependency conflict (run `pip install --dry-run -r requirements.txt` locally first) or an IAM permission gap for the CodeBuild role |
+| Guardrail blocks a clearly on-topic question | A DENY topic's definition is too broad, or it matches the agent's own system prompt - see [Guardrail](#guardrail-optional-topic-restriction) above for how to verify topic definitions with `ApplyGuardrail` directly |
 | First request very slow / times out | Cold start downloading MCP server packages via `uvx`; the Dockerfile pre-warms the cache, but first-ever cold start can still take 20-30s |

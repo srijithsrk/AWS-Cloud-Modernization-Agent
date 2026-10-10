@@ -1,9 +1,6 @@
 """Amazon Bedrock AgentCore entrypoint for the Cloud Modernization Agent.
 
-This agent replicates the agentic cloud-modernization workflow described in
-"Agentic Cloud Modernization: Accelerating Modernization with AWS MCPs and
-Kiro" (AWS Migration & Modernization blog), but as a standalone Bedrock
-AgentCore agent instead of an IDE copilot: given a prompt, it can analyze an
+A standalone Bedrock AgentCore agent that, given a prompt, can analyze an
 existing system, design a target AWS architecture (with diagrams and cost
 estimates), and generate production-ready Infrastructure as Code.
 

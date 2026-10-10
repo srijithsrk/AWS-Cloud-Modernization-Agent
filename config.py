@@ -178,14 +178,14 @@ def _optional_profile_env() -> dict:
 # ---------------------------------------------------------------------------
 # MCP server definitions
 # ---------------------------------------------------------------------------
-# Same shape as the `mcpServers` block in Kiro/Cline's `mcp.json`, so it can
-# be loaded directly with `strands.tools.mcp.MCPClient.load_servers()`.
+# Same shape as the `mcpServers` block used by MCP-aware IDE tools (e.g.
+# Kiro/Cline's `mcp.json`), so it can be loaded directly with
+# `strands.tools.mcp.MCPClient.load_servers()`.
 #
 # This agent uses the official Agent Toolkit for AWS
 # (https://github.com/aws/agent-toolkit-for-aws) as its primary AWS
 # knowledge/API tool - the documented successor to the individual AWS Labs
-# MCP servers the original blog references. Two older servers are
-# intentionally NOT used here:
+# MCP servers. Two older servers are intentionally NOT used here:
 #   - awslabs.aws-documentation-mcp-server -> superseded by aws___search_documentation /
 #                                             aws___read_documentation below
 #   - aws-knowledge-mcp-server              -> AWS's own setup guide says to remove this
@@ -212,12 +212,11 @@ MCP_SERVERS = {
     # execution role in production) via the MCP Proxy for AWS CLI - no
     # interactive OAuth login required, which is what makes it suitable for
     # a headless/automated agent. Exposes: aws___search_documentation,
-    # aws___read_documentation, aws___retrieve_skill (curated AWS "skills",
-    # the successor to the blog's Agent SOPs), aws___list_regions,
-    # aws___get_regional_availability, and aws___run_script (sandboxed
-    # Python - reliable for read-only discovery that doesn't need boto3,
-    # unreliable for anything that does; see aws-pricing-mcp-server below
-    # for real cost estimates).
+    # aws___read_documentation, aws___retrieve_skill (curated AWS "skills"),
+    # aws___list_regions, aws___get_regional_availability, and
+    # aws___run_script (sandboxed Python - reliable for read-only discovery
+    # that doesn't need boto3, unreliable for anything that does; see
+    # aws-pricing-mcp-server below for real cost estimates).
     "aws": {
         "command": "uvx",
         "args": [

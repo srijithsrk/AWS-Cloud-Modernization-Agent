@@ -4,9 +4,9 @@ Replaces the deprecated standalone `terraform-mcp-server` (no longer
 published in https://github.com/awslabs/mcp/tree/main/src - Terraform
 support was dropped when the IaC servers were consolidated into
 `aws-iac-mcp-server`, which only covers CDK + CloudFormation). This tool
-restores equivalent "security compliance with Checkov" behavior described
-in the original workflow by shelling out to the `terraform` and `checkov`
-CLIs, which must be present in the runtime container (see Dockerfile).
+restores equivalent validation (`terraform validate` + security compliance
+with Checkov) by shelling out to the `terraform` and `checkov` CLIs, which
+must be present in the runtime container (see Dockerfile).
 """
 from __future__ import annotations
 
