@@ -1,4 +1,4 @@
-# Cloud Modernization Agent (Amazon Bedrock AgentCore)
+# AWS Cloud Modernization Agent 
 
 An Amazon Bedrock AgentCore agent that helps engineers modernize AWS
 workloads end to end, as a standalone, API-invocable agent (chat in, chat
@@ -81,11 +81,7 @@ read-only pricing lookups.
 
 **Terraform-only implementation.** This agent deliberately never generates
 CDK or CloudFormation - only Terraform, always validated with
-`validate_terraform` before being shown to you. This also means it does not
-run `awslabs.aws-iac-mcp-server` (the CDK/CloudFormation MCP server), which
-avoids that server's `guardpycfn` dependency requiring a Rust toolchain to
-compile for linux/arm64. See `config.py` for the exact MCP servers wired up
-and why.
+`validate_terraform` before being shown to you. See `config.py` for the exact MCP servers wired up and why.
 
 **Topic guardrail.** A Bedrock Guardrail restricts the agent to AWS
 architecture/cost/Terraform questions only, rejecting everything else
